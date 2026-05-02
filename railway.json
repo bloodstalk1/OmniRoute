@@ -8,7 +8,7 @@
     "sleepApplication": false,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3,
-    "healthcheckPath": "/status",
+    "healthcheckPath": "/api/monitoring/health",
     "healthcheckTimeout": 30,
     "startupOverlapSeconds": 30,
     "drainingSeconds": 30,
