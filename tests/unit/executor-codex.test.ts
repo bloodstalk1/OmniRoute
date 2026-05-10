@@ -156,10 +156,10 @@ test("CodexExecutor.buildHeaders binds workspace ids and disables SSE accept for
   assert.equal(standardHeaders.Authorization, "Bearer codex-token");
   assert.equal(standardHeaders.Accept, "text/event-stream");
   assert.equal(standardHeaders["chatgpt-account-id"], "workspace-1");
-  assert.equal(standardHeaders.Version, "0.125.0");
+  assert.equal(standardHeaders.Version, "0.130.0");
   assert.equal(standardHeaders["Openai-Beta"], "responses=experimental");
   assert.equal(standardHeaders["X-Codex-Beta-Features"], "responses_websockets");
-  assert.equal(standardHeaders["User-Agent"], "codex-cli/0.125.0 (Windows 10.0.26200; x64)");
+  assert.equal(standardHeaders["User-Agent"], "codex-cli/0.130.0 (Windows 10.0.26200; x64)");
   assert.equal(compactHeaders.Accept, "application/json");
 });
 
@@ -168,13 +168,13 @@ test("CodexExecutor.buildHeaders honors safe env overrides for Version and User-
 
   await withEnv(
     {
-      CODEX_CLIENT_VERSION: "0.125.0",
+      CODEX_CLIENT_VERSION: "0.130.0",
       CODEX_USER_AGENT: undefined,
     },
     () => {
       const headers = executor.buildHeaders({ accessToken: "codex-token" }, true);
-      assert.equal(headers.Version, "0.125.0");
-      assert.equal(headers["User-Agent"], "codex-cli/0.125.0 (Windows 10.0.26200; x64)");
+      assert.equal(headers.Version, "0.130.0");
+      assert.equal(headers["User-Agent"], "codex-cli/0.130.0 (Windows 10.0.26200; x64)");
     }
   );
 
@@ -185,7 +185,7 @@ test("CodexExecutor.buildHeaders honors safe env overrides for Version and User-
     },
     () => {
       const headers = executor.buildHeaders({ accessToken: "codex-token" }, true);
-      assert.equal(headers.Version, "0.125.0");
+      assert.equal(headers.Version, "0.130.0");
       assert.equal(headers["User-Agent"], "custom-codex/9.9.9");
     }
   );
@@ -468,6 +468,57 @@ test("CodexExecutor.transformRequest does not replay internal assistant commenta
   assert.equal(result.input[3].type, "function_call_output");
 });
 
+test("CodexExecutor.transformRequest preserves replayed assistant final_answer messages", () => {
+  const executor = new CodexExecutor();
+  rememberResponseConversationState(
+    "resp_prev_final_answer_123",
+    [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "9+10?" }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        phase: "final_answer",
+        content: [{ type: "output_text", text: "19" }],
+      },
+    ],
+    []
+  );
+
+  const result = executor.transformRequest(
+    "gpt-5.5-low",
+    {
+      _nativeCodexPassthrough: true,
+      previous_response_id: "resp_prev_final_answer_123",
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "did you answered?" }],
+        },
+      ],
+      stream: false,
+    },
+    false,
+    { requestEndpointPath: "/responses" }
+  );
+
+  assert.equal(
+    result.input.some((item) => JSON.stringify(item).includes('"text":"19"')),
+    true
+  );
+  assert.equal(
+    result.input.some((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+      return item.role === "assistant" && item.phase === "final_answer";
+    }),
+    true
+  );
+});
+
 test("CodexExecutor.transformRequest strips raw internal assistant commentary without dropping useful Responses items", () => {
   const executor = new CodexExecutor();
   const body = {
@@ -489,6 +540,12 @@ test("CodexExecutor.transformRequest strips raw internal assistant commentary wi
         role: "assistant",
         phase: "final",
         content: [{ type: "output_text", text: "Visible final assistant answer." }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        phase: "final_answer",
+        content: [{ type: "output_text", text: "Visible final_answer assistant answer." }],
       },
       {
         type: "message",
@@ -524,6 +581,12 @@ test("CodexExecutor.transformRequest strips raw internal assistant commentary wi
   );
   assert.equal(
     result.input.some((item) => JSON.stringify(item).includes("Visible final assistant answer")),
+    true
+  );
+  assert.equal(
+    result.input.some((item) =>
+      JSON.stringify(item).includes("Visible final_answer assistant answer")
+    ),
     true
   );
   assert.equal(

@@ -15,13 +15,13 @@ import ThinkingBudgetTab from "./components/ThinkingBudgetTab";
 import SystemPromptTab from "./components/SystemPromptTab";
 import ModelAliasesUnified from "./components/ModelAliasesUnified";
 import BackgroundDegradationTab from "./components/BackgroundDegradationTab";
-import CacheSettingsTab from "./components/CacheSettingsTab";
 import MemorySkillsTab from "./components/MemorySkillsTab";
 import ModelsDevSyncTab from "./components/ModelsDevSyncTab";
 import ResilienceTab from "./components/ResilienceTab";
 import CliproxyapiSettingsTab from "./components/CliproxyapiSettingsTab";
 import PayloadRulesTab from "./components/PayloadRulesTab";
 import VisionBridgeSettingsTab from "./components/VisionBridgeSettingsTab";
+import RequestLimitsTab from "./components/RequestLimitsTab";
 import ModelRoutingSection from "@/shared/components/ModelRoutingSection";
 
 const tabs = [
@@ -115,7 +115,6 @@ export default function SettingsPage() {
               </Link>
               <VisionBridgeSettingsTab />
               <SystemPromptTab />
-              <CacheSettingsTab />
               <MemorySkillsTab />
               <ModelsDevSyncTab />
             </div>
@@ -138,6 +137,7 @@ export default function SettingsPage() {
           {activeTab === "advanced" && (
             <div className="flex flex-col gap-6">
               <PayloadRulesTab />
+              <RequestLimitsTab />
               <CliproxyapiSettingsTab />
             </div>
           )}

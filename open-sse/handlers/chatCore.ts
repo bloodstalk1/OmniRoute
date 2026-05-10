@@ -1,5 +1,6 @@
 import { CORS_HEADERS } from "../utils/cors.ts";
 import { detectFormatFromEndpoint, getTargetFormat } from "../services/provider.ts";
+import { injectSystemPrompt } from "../services/systemPrompt.ts";
 import { translateRequest, needsTranslation } from "../translator/index.ts";
 import { FORMATS } from "../translator/formats.ts";
 import {
@@ -10,6 +11,7 @@ import {
 } from "../utils/stream.ts";
 import { ensureStreamReadiness } from "../utils/streamReadiness.ts";
 import { createStreamController, pipeWithDisconnect } from "../utils/streamHandler.ts";
+import { createSseHeartbeatTransform } from "../utils/sseHeartbeat.ts";
 import { addBufferToUsage, filterUsageForFormat, estimateUsage } from "../utils/usageTracking.ts";
 import { refreshWithRetry } from "../services/tokenRefresh.ts";
 import { createRequestLogger } from "../utils/requestLogger.ts";
@@ -20,6 +22,7 @@ import {
 } from "../services/modelStrip.ts";
 import { resolveModelAlias } from "../services/modelDeprecation.ts";
 import { getUnsupportedParams } from "../config/providerRegistry.ts";
+import { supportsMaxTokens } from "@/lib/modelCapabilities.ts";
 import {
   buildErrorBody,
   createErrorResult,
@@ -29,8 +32,10 @@ import {
 import {
   COOLDOWN_MS,
   HTTP_STATUS,
+  MAX_TOOLS_LIMIT,
   PROVIDER_MAX_TOKENS,
   STREAM_IDLE_TIMEOUT_MS,
+  STREAM_READINESS_TIMEOUT_MS,
 } from "../config/constants.ts";
 import {
   classifyProviderError,
@@ -42,6 +47,7 @@ import { isDetailedLoggingEnabled } from "@/lib/db/detailedLogs";
 import { getCallLogPipelineCaptureStreamChunks } from "@/lib/logEnv";
 import { logAuditEvent } from "@/lib/compliance";
 import { extractProviderWarnings } from "@/lib/compliance/providerAudit";
+import { adaptBodyForCompression } from "../services/compression/bodyAdapter.ts";
 import { handleBypassRequest } from "../utils/bypassHandler.ts";
 import {
   saveRequestUsage,
@@ -50,11 +56,7 @@ import {
   appendRequestLog,
   saveCallLog,
 } from "@/lib/usageDb";
-import {
-  getLoggedInputTokens,
-  getLoggedOutputTokens,
-  formatUsageLog,
-} from "@/lib/usage/tokenAccounting";
+import { formatUsageLog } from "@/lib/usage/tokenAccounting";
 import { recordCost } from "@/domain/costRules";
 import { calculateCost } from "@/lib/usage/costCalculator";
 import { buildOmniRouteResponseMetaHeaders } from "@/domain/omnirouteResponseMeta";
@@ -65,6 +67,8 @@ import {
   getModelUpstreamExtraHeaders,
   getUpstreamProxyConfig,
 } from "@/lib/localDb";
+import { getProviderCredentials, extractSessionAffinityKey } from "@/sse/services/auth";
+import { deleteSessionAccountAffinity } from "@/lib/db/sessionAccountAffinity";
 import { getExecutor } from "../executors/index.ts";
 import { getCacheControlSettings } from "@/lib/cacheControlSettings";
 import { guardrailRegistry, resolveDisabledGuardrails } from "@/lib/guardrails";
@@ -76,10 +80,20 @@ import {
   shouldPreserveCacheControl,
   providerSupportsCaching,
 } from "../utils/cacheControlPolicy.ts";
-import { getCacheMetrics } from "@/lib/db/settings.ts";
 import { getCachedSettings } from "@/lib/db/readCache";
+import { applyCodexGlobalFastServiceTier } from "@/lib/providers/codexFastTier";
+import {
+  getCodexRequestDefaults,
+  normalizeCodexServiceTier,
+} from "@/lib/providers/requestDefaults";
 import { cacheReasoningFromAssistantMessage } from "../services/reasoningCache.ts";
 import { sanitizeOpenAITool } from "../services/toolSchemaSanitizer.ts";
+import {
+  getEffectiveToolLimit,
+  setDetectedToolLimit,
+  parseToolLimitFromError,
+  shouldDetectLimit,
+} from "../services/toolLimitDetector.ts";
 
 import {
   parseCodexQuotaHeaders,
@@ -561,10 +575,13 @@ function normalizeNonStreamingEventPayload(rawBody: string, contentType: string)
 }
 
 function getHeaderValueCaseInsensitive(
-  headers: Record<string, unknown> | null | undefined,
+  headers: Record<string, unknown> | Headers | null | undefined,
   targetName: string
 ) {
   if (!headers || typeof headers !== "object") return null;
+  if (headers instanceof Headers) {
+    return headers.get(targetName);
+  }
   const lowered = targetName.toLowerCase();
   for (const [key, value] of Object.entries(headers)) {
     if (key.toLowerCase() === lowered && typeof value === "string" && value.trim()) {
@@ -683,7 +700,8 @@ function resolveAccountSemaphoreKey({
 function buildClaudePromptCacheLogMeta(
   targetFormat: string,
   finalBody: Record<string, unknown> | null | undefined,
-  providerHeaders: Record<string, unknown> | null | undefined
+  providerHeaders: Record<string, unknown> | Headers | null | undefined,
+  clientHeaders?: Headers | Record<string, unknown> | null | undefined
 ) {
   if (targetFormat !== FORMATS.CLAUDE || !finalBody || typeof finalBody !== "object") return null;
 
@@ -752,7 +770,10 @@ function buildClaudePromptCacheLogMeta(
 
   const totalBreakpoints =
     systemBreakpoints.length + toolBreakpoints.length + messageBreakpoints.length;
-  const anthropicBeta = getHeaderValueCaseInsensitive(providerHeaders, "Anthropic-Beta");
+  let anthropicBeta = getHeaderValueCaseInsensitive(providerHeaders, "Anthropic-Beta");
+  if (!anthropicBeta) {
+    anthropicBeta = getHeaderValueCaseInsensitive(clientHeaders, "Anthropic-Beta");
+  }
 
   if (totalBreakpoints === 0 && !anthropicBeta) return null;
 
@@ -963,6 +984,7 @@ export async function handleChatCore({
   comboStepId = null,
   comboExecutionKey = null,
   disableEmergencyFallback = false,
+  cachedSettings = null,
 }) {
   let { provider, model, extendedContext } = modelInfo;
   const requestedModel =
@@ -977,6 +999,22 @@ export async function handleChatCore({
     log?.info?.("STAGE_TRACE", `${traceId} ${label} t=${elapsed}ms${suffix}`);
   };
   let tokensCompressed: number | null = null;
+  body = injectSystemPrompt(body);
+  let effectiveServiceTier: "standard" | "priority" = "standard";
+  const resolveEffectiveServiceTier = (requestBody?: unknown): "standard" | "priority" => {
+    if (provider !== "codex") return "standard";
+    const requestRecord =
+      requestBody && typeof requestBody === "object" && !Array.isArray(requestBody)
+        ? (requestBody as Record<string, unknown>)
+        : {};
+    const rawServiceTier = requestRecord.service_tier;
+    if (typeof rawServiceTier === "string" && rawServiceTier.trim().length > 0) {
+      return normalizeCodexServiceTier(rawServiceTier) ? "priority" : "standard";
+    }
+    return getCodexRequestDefaults(credentials?.providerSpecificData).serviceTier === "priority"
+      ? "priority"
+      : "standard";
+  };
   const persistFailureUsage = (statusCode: number, errorCode?: string | null) => {
     saveRequestUsage({
       provider: provider || "unknown",
@@ -991,6 +1029,7 @@ export async function handleChatCore({
       connectionId: connectionId || undefined,
       apiKeyId: apiKeyInfo?.id || undefined,
       apiKeyName: apiKeyInfo?.name || undefined,
+      serviceTier: effectiveServiceTier,
     }).catch(() => {});
   };
 
@@ -1080,7 +1119,9 @@ export async function handleChatCore({
             | undefined)
         : undefined;
     const idempotentCost = idempotentUsage
-      ? await calculateCost(provider, model, idempotentUsage)
+      ? await calculateCost(provider, model, idempotentUsage as Record<string, number>, {
+          serviceTier: effectiveServiceTier,
+        })
       : 0;
     return {
       success: true,
@@ -1174,7 +1215,7 @@ export async function handleChatCore({
   // the correct, aliased model ID. Without this, aliases only affect format detection.
   const resolvedModel = resolveModelAlias(model);
   // Use resolvedModel for all downstream operations (routing, provider requests, logging)
-  const effectiveModel = resolvedModel !== model ? resolvedModel : model;
+  const effectiveModel = resolvedModel === model ? model : resolvedModel;
   if (resolvedModel !== model) {
     log?.info?.("ALIAS", `Model alias applied: ${model} → ${resolvedModel}`);
   }
@@ -1374,7 +1415,7 @@ export async function handleChatCore({
   const acceptHeader =
     clientRawRequest?.headers && typeof clientRawRequest.headers.get === "function"
       ? clientRawRequest.headers.get("accept") || clientRawRequest.headers.get("Accept")
-      : (clientRawRequest?.headers || {})["accept"] || (clientRawRequest?.headers || {})["Accept"];
+      : clientRawRequest?.headers?.["accept"] || clientRawRequest?.headers?.["Accept"];
 
   const explicitStreamAlias = resolveExplicitStreamAlias(body);
 
@@ -1398,7 +1439,9 @@ export async function handleChatCore({
     nativeCodexPassthrough && isCompactResponsesEndpoint(endpointPath)
       ? false
       : resolveStreamFlag(body?.stream, acceptHeader);
-  const settings = await getCachedSettings();
+  const settings = cachedSettings ?? (await getCachedSettings());
+  credentials = applyCodexGlobalFastServiceTier(provider, credentials, settings);
+  effectiveServiceTier = resolveEffectiveServiceTier(body);
   setGeminiThoughtSignatureMode(settings.antigravitySignatureCacheMode);
   const semanticCacheEnabled = settings.semanticCacheEnabled !== false;
 
@@ -1435,7 +1478,11 @@ export async function handleChatCore({
       const cachedUsage =
         extractUsageFromResponse(cached as Record<string, unknown>, provider) ||
         ((cached as Record<string, unknown>)?.usage as Record<string, unknown> | undefined);
-      const cachedCost = cachedUsage ? await calculateCost(provider, model, cachedUsage) : 0;
+      const cachedCost = cachedUsage
+        ? await calculateCost(provider, model, cachedUsage as Record<string, number>, {
+            serviceTier: effectiveServiceTier,
+          })
+        : 0;
       persistAttemptLogs({
         status: 200,
         tokens: (cached as Record<string, unknown>)?.usage,
@@ -1600,8 +1647,10 @@ export async function handleChatCore({
   // ── Proactive Context Compression (Phase 4) ──
   // Check if context exceeds 70% of limit and compress proactively before sending to provider.
   // This prevents "prompt too long" errors for large-but-not-full contexts.
-  const allMessages =
-    body?.messages || body?.input || body?.contents || body?.request?.contents || [];
+  const compressionBody = body
+    ? adaptBodyForCompression(body as Record<string, unknown>).body
+    : null;
+  const allMessages = compressionBody?.messages || body?.contents || body?.request?.contents || [];
   let cavemanOutputModeApplied = false;
   let cavemanOutputModeIntensity: string | null = null;
   if (body && Array.isArray(allMessages) && allMessages.length > 0) {
@@ -1754,7 +1803,7 @@ export async function handleChatCore({
               comboOverrides: {
                 ...(config.comboOverrides ?? {}),
                 ...(comboName ? { [comboName]: comboMode } : {}),
-                ...(comboConfig?.id ? { [comboConfig.id]: comboMode } : {}),
+                ...(comboConfig?.id ? { [String(comboConfig.id)]: comboMode } : {}),
               },
             };
             compressionComboKey = comboName;
@@ -1884,12 +1933,14 @@ export async function handleChatCore({
                   0,
                   result.stats.originalTokens - result.stats.compressedTokens
                 );
+                const rtkPointers = result.stats.rtkRawOutputPointers ?? [];
                 const estimatedUsdSaved = await calculateCost(
                   provider ?? "",
                   effectiveModel ?? "",
                   {
                     input: tokensSaved,
-                  }
+                  },
+                  { serviceTier: effectiveServiceTier }
                 );
                 insertCompressionAnalyticsRow({
                   timestamp: new Date().toISOString(),
@@ -1907,8 +1958,14 @@ export async function handleChatCore({
                   estimated_usd_saved: estimatedUsdSaved || null,
                   validation_fallback: result.stats.fallbackApplied ? 1 : 0,
                   output_mode: cavemanOutputModeApplied ? cavemanOutputModeIntensity : null,
-                  rtk_raw_output_pointer: result.stats.rtkRawOutputPointers?.[0]?.id ?? null,
-                  rtk_raw_output_bytes: result.stats.rtkRawOutputPointers?.[0]?.bytes ?? null,
+                  rtk_raw_output_pointer: rtkPointers[0]?.id ?? null,
+                  rtk_raw_output_bytes: rtkPointers[0]?.bytes ?? null,
+                  rtk_raw_output_pointers: rtkPointers.length
+                    ? JSON.stringify(rtkPointers.map((pointer) => pointer.id))
+                    : null,
+                  rtk_raw_output_total_bytes: rtkPointers.length
+                    ? rtkPointers.reduce((total, pointer) => total + pointer.bytes, 0)
+                    : null,
                 });
               } catch (err) {
                 log?.debug?.(
@@ -2309,6 +2366,19 @@ export async function handleChatCore({
 
       log?.debug?.("FORMAT", `claude passthrough (preserveCache=${preserveCacheControl})`);
 
+      // Migrate deprecated top-level `output_format` → `output_config.format`.
+      // Anthropic returns a 400 on the legacy field; some clients (e.g. ForgeCode)
+      // still emit it. Preserves an existing output_config.format if present.
+      if (translatedBody.output_format !== undefined) {
+        const oc =
+          translatedBody.output_config && typeof translatedBody.output_config === "object"
+            ? (translatedBody.output_config as Record<string, unknown>)
+            : {};
+        if (oc.format === undefined) oc.format = translatedBody.output_format;
+        translatedBody.output_config = oc;
+        delete translatedBody.output_format;
+      }
+
       // Fix #1719: Strip output_config.format for non-Anthropic Claude-compatible providers.
       // Third-party Claude endpoints (MiniMax, DeepSeek via aggregators) reject this field
       // with 400 errors since they don't support Anthropic's structured output / json_schema.
@@ -2353,11 +2423,11 @@ export async function handleChatCore({
               type: "function",
               function: {
                 name: t.name,
-                ...(t.description !== undefined ? { description: t.description } : {}),
+                ...(t.description === undefined ? {} : { description: t.description }),
                 ...(t.parameters !== undefined || t.input_schema !== undefined
                   ? { parameters: t.parameters ?? t.input_schema ?? {} }
                   : {}),
-                ...(t.strict !== undefined ? { strict: t.strict } : {}),
+                ...(t.strict === undefined ? {} : { strict: t.strict }),
               },
             };
           });
@@ -2487,6 +2557,17 @@ export async function handleChatCore({
     }
     if (stripped.length > 0) {
       log?.warn?.("PARAMS", `Stripped unsupported params for ${model}: ${stripped.join(", ")}`);
+    }
+  }
+
+  // Rename max_tokens to max_completion_tokens if not supported (#1961)
+  if (!supportsMaxTokens({ provider, model })) {
+    if (translatedBody.max_tokens !== undefined) {
+      if (translatedBody.max_completion_tokens === undefined) {
+        translatedBody.max_completion_tokens = translatedBody.max_tokens;
+      }
+      delete translatedBody.max_tokens;
+      log?.debug?.("PARAMS", `Renamed max_tokens to max_completion_tokens for ${model}`);
     }
   }
 
@@ -2652,6 +2733,20 @@ export async function handleChatCore({
         );
       }
 
+      const effectiveToolLimit = getEffectiveToolLimit(provider);
+      if (
+        effectiveToolLimit < MAX_TOOLS_LIMIT &&
+        Array.isArray(bodyToSend.tools) &&
+        bodyToSend.tools.length > effectiveToolLimit
+      ) {
+        const truncatedTools = bodyToSend.tools.slice(0, effectiveToolLimit);
+        bodyToSend = { ...bodyToSend, tools: truncatedTools };
+        log?.debug?.(
+          "TOOL_LIMIT",
+          `Truncated ${bodyToSend.tools.length} tools to ${effectiveToolLimit} for ${provider}`
+        );
+      }
+
       // Qwen OAuth rejects requests without a non-empty `user` field.
       // Some minimal OpenAI-compatible clients omit it, so we backfill a
       // stable default only for OAuth mode (API key mode is unaffected).
@@ -2704,7 +2799,16 @@ export async function handleChatCore({
           async () => {
             trace("inside_rate_limit");
             let attempts = 0;
-            const maxAttempts = provider === "qwen" ? 3 : 1;
+            const maxAttempts = provider === "qwen" ? 3 : provider === "codex" ? 3 : 1;
+
+            // ── Codex 429 account-rotation state ─────────────────────────────────
+            // Track excluded connection IDs for codex failover across attempts.
+            const codexExcludedIds: string[] = [];
+            // Derive session affinity key once for codex failover (used to clear affinity on 429).
+            const codexSessionAffinityKey =
+              provider === "codex"
+                ? (extractSessionAffinityKey(body, clientRawRequest?.headers) ?? null)
+                : null;
 
             while (attempts < maxAttempts) {
               trace("pre_executor", { attempt: attempts });
@@ -2712,7 +2816,7 @@ export async function handleChatCore({
                 model: modelToCall,
                 body: bodyToSend,
                 stream: upstreamStream,
-                credentials: executionCredentials,
+                credentials: getExecutionCredentials(),
                 signal: streamController.signal,
                 log,
                 extendedContext,
@@ -2741,6 +2845,84 @@ export async function handleChatCore({
                 }
               }
 
+              // Codex 429 account-rotation failover (disabled for context-relay so combo.ts can inject handoff)
+              if (
+                provider === "codex" &&
+                comboStrategy !== "context-relay" &&
+                res.response.status === 429 &&
+                attempts < maxAttempts - 1
+              ) {
+                const failedConnectionId = credentials?.connectionId || connectionId;
+                const retryAfterHeader = res.response.headers.get("retry-after");
+                const retryAfterMs = retryAfterHeader
+                  ? Number.parseFloat(retryAfterHeader) * 1000
+                  : null;
+
+                log?.warn?.(
+                  "CODEX_FAILOVER",
+                  `429 on connection ${String(failedConnectionId).slice(0, 8)} (attempt ${attempts + 1}/${maxAttempts}), rotating account`
+                );
+
+                // Mark current connection as rate-limited in the DB
+                if (failedConnectionId) {
+                  const rateLimitedUntil = new Date(
+                    Date.now() + (retryAfterMs || 60_000)
+                  ).toISOString();
+                  updateProviderConnection(String(failedConnectionId), {
+                    rateLimitedUntil,
+                    testStatus: "unavailable",
+                    lastError: "429 rate limited — codex account rotation",
+                    errorCode: 429,
+                  }).catch(() => {});
+                  if (!codexExcludedIds.includes(String(failedConnectionId))) {
+                    codexExcludedIds.push(String(failedConnectionId));
+                  }
+                }
+
+                // Clear session affinity so next request won't be pinned to the failing account
+                if (codexSessionAffinityKey) {
+                  try {
+                    deleteSessionAccountAffinity(codexSessionAffinityKey, "codex");
+                  } catch {
+                    // best-effort
+                  }
+                }
+
+                // Fetch next available codex connection (excluding all previously failed ones)
+                const nextCreds = await getProviderCredentials("codex", null, null, null, {
+                  excludeConnectionIds: [...codexExcludedIds],
+                }).catch(() => null);
+
+                if (!nextCreds || nextCreds.allRateLimited) {
+                  log?.warn?.("CODEX_FAILOVER", "No more codex accounts available — returning 429");
+                  return res;
+                }
+
+                const newConnectionId = nextCreds.connectionId;
+                log?.info?.(
+                  "CODEX_FAILOVER",
+                  `Rotating codex account: ${String(failedConnectionId).slice(0, 8)} → ${newConnectionId.slice(0, 8)} (attempt ${attempts + 2}/${maxAttempts})`
+                );
+
+                logAuditEvent({
+                  action: "codex.account_rotation",
+                  actor: apiKeyInfo?.name || "system",
+                  target: newConnectionId,
+                  details: {
+                    failed_connection_id: failedConnectionId,
+                    new_connection_id: newConnectionId,
+                    attempt: attempts + 1,
+                    retry_after_ms: retryAfterMs,
+                  },
+                });
+
+                // Update credentials in-place so getExecutionCredentials() picks up the new account
+                Object.assign(credentials, nextCreds);
+
+                attempts++;
+                continue;
+              }
+
               // For streaming: release the semaphore when the client drains or cancels the stream.
               if (stream) {
                 const originalBody = res.response.body;
@@ -2759,6 +2941,7 @@ export async function handleChatCore({
                       headers: res.response.headers,
                     }
                   ),
+                  headers: res.response.headers,
                 };
               }
 
@@ -2775,17 +2958,18 @@ export async function handleChatCore({
         // Non-stream: release semaphore immediately after reading full response body.
         const status = rawResult.response.status;
         const statusText = rawResult.response.statusText;
-        const headers = Array.from(rawResult.response.headers.entries()) as [string, string][];
+        const headers = new Headers(rawResult.response.headers);
         const payload = await withBodyTimeout<string>(rawResult.response.text());
         acquireAccountSemaphoreRelease();
 
         return {
           ...rawResult,
           response: new Response(payload, { status, statusText, headers }),
+          headers,
           _dedupSnapshot: {
             status,
             statusText,
-            headers,
+            headers: Array.from(headers.entries()),
             payload,
           },
         };
@@ -2823,6 +3007,8 @@ export async function handleChatCore({
     translatedBody.messages?.length ||
     translatedBody.contents?.length ||
     translatedBody.request?.contents?.length ||
+    (translatedBody.conversationState?.history?.length ?? 0) +
+      (translatedBody.conversationState?.currentMessage ? 1 : 0) ||
     0;
   log?.debug?.("REQUEST", `${provider.toUpperCase()} | ${model} | ${msgCount} msgs`);
 
@@ -2840,10 +3026,12 @@ export async function handleChatCore({
     providerUrl = result.url;
     providerHeaders = result.headers;
     finalBody = result.transformedBody;
+    effectiveServiceTier = resolveEffectiveServiceTier(finalBody);
     claudePromptCacheLogMeta = buildClaudePromptCacheLogMeta(
       targetFormat,
       finalBody,
-      providerHeaders
+      providerHeaders,
+      clientRawRequest?.headers
     );
 
     // Log target request (final request to provider)
@@ -2936,11 +3124,22 @@ export async function handleChatCore({
     upstreamErrorParsed = true;
   }
 
+  const errorMessageForToolDetection =
+    typeof upstreamErrorBody === "string"
+      ? upstreamErrorBody
+      : JSON.stringify(upstreamErrorBody ?? {});
+  if (shouldDetectLimit(errorMessageForToolDetection, parsedStatusCode)) {
+    const detectedLimit = parseToolLimitFromError(errorMessageForToolDetection);
+    if (detectedLimit) {
+      setDetectedToolLimit(provider, detectedLimit);
+      log?.info?.("TOOL_LIMIT", `Detected tool limit ${detectedLimit} for ${provider}`);
+    }
+  }
+
   const isQwenExpiredError =
     provider === "qwen" &&
     parsedStatusCode === HTTP_STATUS.BAD_REQUEST &&
-    parsedMessage &&
-    parsedMessage.toLowerCase().includes("session has expired");
+    parsedMessage?.toLowerCase().includes("session has expired");
 
   const streamOptionsOnlyFailed = false; // TODO: properly track stream options failure? (placeholder from existing logic)
 
@@ -2992,7 +3191,7 @@ export async function handleChatCore({
         if (retryResult.response.ok) {
           providerResponse = retryResult.response;
           providerUrl = retryResult.url;
-          providerHeaders = retryResult.headers;
+          providerHeaders = new Headers(retryResult.headers || {});
           finalBody = retryResult.transformedBody;
           reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
           updatePendingRequest(model, provider, connectionId, {
@@ -3345,7 +3544,7 @@ export async function handleChatCore({
               translatedBody.model = fbDecision.model;
               providerResponse = fbResult.response;
               providerUrl = fbResult.url;
-              providerHeaders = fbResult.headers;
+              providerHeaders = new Headers(fbResult.headers || {});
               finalBody = fbResult.transformedBody;
               reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
               log?.info?.(
@@ -3548,26 +3747,6 @@ export async function handleChatCore({
       const msg = `[${new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" })}] 📊 [USAGE] ${provider.toUpperCase()} | ${formatUsageLog(usage)}${connectionId ? ` | account=${connectionId.slice(0, 8)}...` : ""}`;
       console.log(`${COLORS.green}${msg}${COLORS.reset}`);
 
-      // Track cache token metrics
-      const inputTokens = usage.prompt_tokens || 0;
-      const cachedTokens = toPositiveNumber(
-        usage.cache_read_input_tokens ??
-          usage.cached_tokens ??
-          (
-            (usage as Record<string, unknown>).prompt_tokens_details as
-              | Record<string, unknown>
-              | undefined
-          )?.cached_tokens
-      );
-      const cacheCreationTokens = toPositiveNumber(
-        usage.cache_creation_input_tokens ??
-          (
-            (usage as Record<string, unknown>).prompt_tokens_details as
-              | Record<string, unknown>
-              | undefined
-          )?.cache_creation_tokens
-      );
-
       saveRequestUsage({
         provider: provider || "unknown",
         model: model || "unknown",
@@ -3581,6 +3760,7 @@ export async function handleChatCore({
         connectionId: connectionId || undefined,
         apiKeyId: apiKeyInfo?.id || undefined,
         apiKeyName: apiKeyInfo?.name || undefined,
+        serviceTier: effectiveServiceTier,
       }).catch((err) => {
         console.error("Failed to save usage stats:", err.message);
       });
@@ -3593,7 +3773,7 @@ export async function handleChatCore({
           responseBody,
           responsePayloadFormat,
           clientResponseFormat,
-          responseToolNameMap as Map<string, string> | null
+          responseToolNameMap
         )
       : responseBody;
     const memoryExtractionResponse = translatedResponse;
@@ -3713,7 +3893,9 @@ export async function handleChatCore({
       (translatedResponse?.usage && typeof translatedResponse.usage === "object"
         ? translatedResponse.usage
         : null);
-    const estimatedCost = responseUsage ? await calculateCost(provider, model, responseUsage) : 0;
+    const estimatedCost = responseUsage
+      ? await calculateCost(provider, model, responseUsage, { serviceTier: effectiveServiceTier })
+      : 0;
 
     if (postCallGuardrails.blocked) {
       const guardrailMessage = postCallGuardrails.message || "Response blocked by guardrail";
@@ -3789,6 +3971,7 @@ export async function handleChatCore({
       success: true,
       response: new Response(JSON.stringify(translatedResponse), {
         headers: {
+          ...Object.fromEntries(providerHeaders.entries()),
           "Content-Type": "application/json",
           [OMNIROUTE_RESPONSE_HEADERS.cache]: "MISS",
           ...buildOmniRouteResponseMetaHeaders({
@@ -3806,7 +3989,7 @@ export async function handleChatCore({
 
   // Streaming response
   const streamReadiness = await ensureStreamReadiness(providerResponse, {
-    timeoutMs: STREAM_IDLE_TIMEOUT_MS,
+    timeoutMs: STREAM_READINESS_TIMEOUT_MS,
     provider,
     model,
     log,
@@ -3816,8 +3999,8 @@ export async function handleChatCore({
     const failure = {
       status: failureResponse.status,
       message: reason,
-      code: "stream_readiness_timeout",
-      type: "stream_timeout",
+      code: streamReadiness.code,
+      type: streamReadiness.type,
     };
     trackPendingRequest(model, provider, connectionId, false);
     appendRequestLog({
@@ -3834,7 +4017,7 @@ export async function handleChatCore({
       claudeCacheMeta: claudePromptCacheLogMeta,
       cacheSource: "upstream",
     });
-    persistFailureUsage(failureResponse.status, "stream_readiness_timeout");
+    persistFailureUsage(failureResponse.status, streamReadiness.code);
     // Do NOT call onStreamFailure — a stream stall is an upstream issue,
     // not an account/quota failure. Marking the account unavailable here
     // would lock out legitimate accounts when the upstream hangs.
@@ -3842,7 +4025,7 @@ export async function handleChatCore({
       success: false,
       status: failureResponse.status,
       error: reason,
-      errorType: "stream_readiness_timeout",
+      errorType: streamReadiness.type,
       response: failureResponse,
     };
   }
@@ -3853,10 +4036,16 @@ export async function handleChatCore({
     await onRequestSuccess();
   }
 
-  const responseHeaders = {
+  const responseHeaders: Record<string, string> = {
+    ...Object.fromEntries(
+      Array.from(providerResponse.headers.entries()).filter(
+        ([k]) => k.toLowerCase() !== "content-type"
+      )
+    ),
     "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
     [OMNIROUTE_RESPONSE_HEADERS.cache]: "MISS",
     ...buildOmniRouteResponseMetaHeaders({
       provider,
@@ -3911,24 +4100,6 @@ export async function handleChatCore({
     // Track cache token metrics for streaming responses
     if (streamUsage && typeof streamUsage === "object") {
       attachCompressionUsageReceiptAfterAnalytics(streamUsage as Record<string, unknown>, "stream");
-      const inputTokens = streamUsage.prompt_tokens || 0;
-      const cachedTokens = toPositiveNumber(
-        streamUsage.cache_read_input_tokens ??
-          streamUsage.cached_tokens ??
-          (
-            (streamUsage as Record<string, unknown>).prompt_tokens_details as
-              | Record<string, unknown>
-              | undefined
-          )?.cached_tokens
-      );
-      const cacheCreationTokens = toPositiveNumber(
-        streamUsage.cache_creation_input_tokens ??
-          (
-            (streamUsage as Record<string, unknown>).prompt_tokens_details as
-              | Record<string, unknown>
-              | undefined
-          )?.cache_creation_tokens
-      );
 
       saveRequestUsage({
         provider: provider || "unknown",
@@ -3943,6 +4114,7 @@ export async function handleChatCore({
         connectionId: connectionId || undefined,
         apiKeyId: apiKeyInfo?.id || undefined,
         apiKeyName: apiKeyInfo?.name || undefined,
+        serviceTier: effectiveServiceTier,
       }).catch((err) => {
         console.error("Failed to save usage stats:", err.message);
       });
@@ -3961,7 +4133,7 @@ export async function handleChatCore({
     });
 
     if (apiKeyInfo?.id && streamUsage) {
-      calculateCost(provider, model, streamUsage)
+      calculateCost(provider, model, streamUsage, { serviceTier: effectiveServiceTier })
         .then((estimatedCost) => {
           if (estimatedCost > 0) recordCost(apiKeyInfo.id, estimatedCost);
         })
@@ -4100,6 +4272,9 @@ export async function handleChatCore({
   } else {
     finalStream = pipeWithDisconnect(providerResponse, transformStream, streamController);
   }
+  finalStream = finalStream.pipeThrough(
+    createSseHeartbeatTransform({ signal: streamController.signal })
+  );
 
   return {
     success: true,

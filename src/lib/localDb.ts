@@ -13,6 +13,7 @@ export {
   createProviderConnection,
   updateProviderConnection,
   deleteProviderConnection,
+  deleteProviderConnections,
   deleteProviderConnectionsByProvider,
   reorderProviderConnections,
   cleanupProviderConnections,
@@ -91,6 +92,7 @@ export {
   validateApiKey,
   getApiKeyMetadata,
   updateApiKeyPermissions,
+  regenerateApiKey,
   isModelAllowedForKey,
   clearApiKeyCaches,
   resetApiKeyState,
@@ -145,6 +147,14 @@ export {
 } from "./db/settings";
 
 export type { PricingSource, PricingSourceMap } from "./db/settings";
+
+export {
+  getDatabaseSettings,
+  getUserDatabaseSettings,
+  updateDatabaseSettings,
+} from "./db/databaseSettings";
+
+export type { UserDatabaseSettings } from "./db/databaseSettings";
 
 export {
   // Proxy Registry
@@ -236,7 +246,7 @@ export {
   getFile,
   getFileContent,
   listFiles,
-  updateFileStatus,
+  countFiles,
   formatFileResponse,
   deleteFile,
 } from "./db/files";
@@ -247,6 +257,7 @@ export {
   getBatch,
   updateBatch,
   listBatches,
+  countBatches,
   getPendingBatches,
   getTerminalBatches,
 } from "./db/batches";
@@ -276,6 +287,8 @@ export {
   getAggregatedSnapshots,
   cleanupOldSnapshots,
 } from "./db/quotaSnapshots";
+
+export * from "./db/sessionAccountAffinity";
 
 export type { QuotaSnapshotRow, ProviderUtilizationPoint } from "@/shared/types/utilization";
 

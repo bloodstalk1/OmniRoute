@@ -18,6 +18,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import type Database from "better-sqlite3";
+import { DEFAULT_DATABASE_SETTINGS } from "@/types/databaseSettings";
 
 /**
  * Resolve the migrations directory path safely across platforms.
@@ -109,10 +110,28 @@ const RENAMED_MIGRATION_COMPATIBILITY = [
     toName: "provider_connection_max_concurrent",
   },
   {
+    fromVersion: "028",
+    fromName: "compression_settings",
+    toVersion: "034",
+    toName: "compression_settings",
+  },
+  {
     fromVersion: "032",
     fromName: "create_reasoning_cache",
     toVersion: "033",
     toName: "create_reasoning_cache",
+  },
+  {
+    fromVersion: "032",
+    fromName: "compression_analytics",
+    toVersion: "038",
+    toName: "compression_analytics",
+  },
+  {
+    fromVersion: "033",
+    fromName: "compression_cache_stats",
+    toVersion: "039",
+    toName: "compression_cache_stats",
   },
 ] as const;
 
@@ -284,6 +303,10 @@ function isSchemaAlreadyApplied(
       );
     case "045":
       return hasColumn(db, "call_logs", "tokens_compressed");
+    case "053":
+      return !hasColumn(db, "files", "status");
+    case "054":
+      return hasColumn(db, "usage_history", "service_tier");
     default:
       return false;
   }
@@ -799,7 +822,42 @@ export function runMigrations(db: Database.Database, options?: { isNewDb?: boole
     console.log(`[Migration] ${count} migration(s) applied successfully.`);
   }
 
+  // After applying all migrations, insert default settings if we just ran migration 46
+  try {
+    if (appliedRecords.some((m) => m.name.startsWith("051_"))) {
+      insertDefaultDatabaseSettings(db);
+    }
+  } catch (error) {
+    console.error("Error inserting default database settings:", error);
+  }
+
   return count;
+}
+
+function insertDefaultDatabaseSettings(db: Database.Database) {
+  const tx = db.transaction(() => {
+    // Insert all default settings
+    for (const [section, values] of Object.entries(DEFAULT_DATABASE_SETTINGS)) {
+      for (const [key, value] of Object.entries(values as Record<string, unknown>)) {
+        db.prepare("INSERT OR IGNORE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
+          "databaseSettings",
+          `${section}.${key}`,
+          JSON.stringify(value)
+        );
+      }
+    }
+  });
+
+  // Run in an immediate transaction to avoid nested transactions
+  try {
+    // @ts-expect-error - Better-SQLite3 transaction types
+    db.immediate(() => {
+      tx();
+    });
+  } catch (error) {
+    console.error("Transaction error inserting default settings:", error);
+    throw error;
+  }
 }
 
 /**

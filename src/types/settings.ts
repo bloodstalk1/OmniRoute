@@ -15,6 +15,7 @@ export interface Settings {
   stickyRoundRobinLimit: number;
   requestRetry: number;
   maxRetryIntervalSec: number;
+  maxBodySizeMb?: number;
   jwtSecret?: string;
   mcpEnabled?: boolean;
   mcpTransport?: "stdio" | "sse" | "streamable-http";
@@ -31,6 +32,7 @@ export interface ComboDefaults {
   strategy: RoutingStrategyValue;
   maxRetries: number;
   retryDelayMs: number;
+  fallbackDelayMs?: number;
   maxComboDepth: number;
   trackMetrics: boolean;
   concurrencyPerModel?: number;
